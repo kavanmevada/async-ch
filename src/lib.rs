@@ -1,5 +1,6 @@
 use core::fmt::Debug;
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -31,7 +32,7 @@ pub enum RecvState<T> {
 pub struct Channel<T> {
     sending: Vec<(Arc<Waker>, SendState<T>)>,
     waiting: Vec<(Arc<Waker>, RecvState<T>)>,
-    queue: Vec<Option<T>>,
+    queue: VecDeque<Option<T>>,
     length: usize,
 }
 
@@ -48,14 +49,14 @@ impl<T> Channel<T> {
             Self {
                 sending: Vec::default(),
                 waiting: Vec::default(),
-                queue: Vec::default(),
+                queue: VecDeque::default(),
                 length,
             }
         } else {
             Self {
                 sending: Vec::with_capacity(length),
                 waiting: Vec::with_capacity(length),
-                queue: Vec::with_capacity(length),
+                queue: VecDeque::with_capacity(length),
                 length,
             }
         }
@@ -203,7 +204,7 @@ impl<T: Debug> Sender<T> {
                 }
 
                 if channel.queue.len() < channel.length {
-                    channel.queue.push(msg_op.take());
+                    channel.queue.push_back(msg_op.take());
                     return Poll::Ready(Ok(()));
                 }
 
@@ -370,7 +371,7 @@ impl<T: Debug> Receiver<T> {
                 }
 
                 if !channel.queue.is_empty() {
-                    if let Some(msg) = channel.queue.remove(0) {
+                    if let Some(Some(msg)) = channel.queue.pop_front() {
                         return Poll::Ready(Ok(msg));
                     }
                 }
