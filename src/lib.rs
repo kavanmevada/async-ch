@@ -50,15 +50,15 @@ impl<T> Channel<T> {
     fn with_capacity(length: usize) -> Self {
         if length == usize::MAX {
             Self {
-                sending: Vec::with_capacity(64),
-                waiting: Vec::with_capacity(64),
+                sending: Vec::with_capacity(32),
+                waiting: Vec::with_capacity(32),
                 queue: VecDeque::default(),
                 length,
             }
         } else {
             Self {
-                sending: Vec::with_capacity(64),
-                waiting: Vec::with_capacity(64),
+                sending: Vec::with_capacity(32),
+                waiting: Vec::with_capacity(32),
                 queue: VecDeque::with_capacity(length),
                 length,
             }
@@ -101,7 +101,7 @@ impl<'r, T> Drop for SenderGuard<'r, T> {
             if let Some((w, state)) = channel
                 .sending
                 .iter_mut()
-                .find(|(w, _)| Arc::downgrade(w).ptr_eq(&self.1))
+                .find(|(w, _)| std::ptr::eq(&**w, self.1.as_ptr()))
             {
                 *state = SendState::Cancelled;
                 w.wake_by_ref();
@@ -118,7 +118,7 @@ pub struct SendError<T>(pub T);
 
 impl<T: Debug> Sender<T> {
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        futures::executor::block_on(self.send_async(msg))
+        futures_lite::future::block_on(self.send_async(msg))
     }
 
     pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
@@ -135,21 +135,14 @@ impl<T: Debug> Sender<T> {
             //     channel
             // );
 
-            if let Some((pos, w, state)) =
-                channel
-                    .sending
-                    .iter_mut()
-                    .enumerate()
-                    .find_map(|(p, (w, s))| {
-                        if Arc::downgrade(w).ptr_eq(&guard.1) {
-                            Some((p, w, s))
-                        } else {
-                            None
-                        }
-                    })
-            {
-                // Second Poll
+            let slot_at = *channel
+                .sending
+                .iter()
+                .position(|(w, _)| core::ptr::eq(&**w, guard.1.as_ptr()))
+                .get_or_insert(channel.sending.len());
 
+            if let Some((w, state)) = channel.sending.get_mut(slot_at) {
+                // Second Poll
                 match state {
                     SendState::Pending(msg_op) => {
                         if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
@@ -167,7 +160,7 @@ impl<T: Debug> Sender<T> {
                         }
                     }
                     SendState::Done | SendState::Cancelled => {
-                        channel.sending.remove(pos);
+                        channel.sending.remove(slot_at);
                         self.0.nsending.fetch_sub(1, Ordering::AcqRel);
 
                         // println!(
@@ -210,7 +203,7 @@ impl<T: Debug> Sender<T> {
 
                 channel
                     .sending
-                    .push((waker, SendState::Pending(msg_op.take())));
+                    .insert(slot_at, (waker, SendState::Pending(msg_op.take())));
 
                 self.0.nsending.fetch_add(1, Ordering::AcqRel);
 
@@ -255,7 +248,7 @@ impl<'r, T> Drop for ReceiverGuard<'r, T> {
             if let Some((w, state)) = channel
                 .waiting
                 .iter_mut()
-                .find(|(w, _)| Arc::downgrade(w).ptr_eq(&self.1))
+                .find(|(w, _)| std::ptr::eq(&**w, self.1.as_ptr()))
             {
                 *state = RecvState::Cancelled;
                 w.wake_by_ref();
@@ -276,14 +269,14 @@ pub enum RecvError {
 
 impl<T: Debug> Receiver<T> {
     pub fn recv(&self) -> Result<T, RecvError> {
-        futures::executor::block_on(self.recv_async())
+        futures_lite::future::block_on(self.recv_async())
     }
 
     pub async fn recv_async(&self) -> Result<T, RecvError> {
         let mut guard = ReceiverGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
-            let mut channel = self.0.channel.lock().or(Err(RecvError::Disconnected))?;
+            let mut channel = self.0.channel.lock().expect("poison error");
 
             // println!(
             //     "{:?}: recv(before) {:?}",
@@ -291,19 +284,13 @@ impl<T: Debug> Receiver<T> {
             //     channel
             // );
 
-            if let Some((pos, w, state)) =
-                channel
-                    .waiting
-                    .iter_mut()
-                    .enumerate()
-                    .find_map(|(p, (w, s))| {
-                        if Arc::downgrade(w).ptr_eq(&guard.1) {
-                            Some((p, w, s))
-                        } else {
-                            None
-                        }
-                    })
-            {
+            let slot_at = *channel
+                .waiting
+                .iter()
+                .position(|(w, _)| core::ptr::eq(&**w, guard.1.as_ptr()))
+                .get_or_insert(channel.waiting.len());
+
+            if let Some((w, state)) = channel.waiting.get_mut(slot_at) {
                 // Second Poll
 
                 match state {
@@ -328,7 +315,7 @@ impl<T: Debug> Receiver<T> {
                     }
                     RecvState::Done(msg_op) => {
                         let msg_op = msg_op.take();
-                        channel.waiting.remove(pos);
+                        channel.waiting.remove(slot_at);
                         self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
                         // println!(
                         //     "{:?}: recv(after) removed from waiting by receiver {:?}",
@@ -339,7 +326,7 @@ impl<T: Debug> Receiver<T> {
                         Poll::Ready(Ok(msg_op.unwrap()))
                     }
                     RecvState::Cancelled => {
-                        channel.waiting.remove(pos);
+                        channel.waiting.remove(slot_at);
                         self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
                         // println!(
                         //     "{:?}: recv(after) removed from waiting by receiver {:?}",
@@ -380,7 +367,7 @@ impl<T: Debug> Receiver<T> {
 
                 let waker = Arc::new(cx.waker().clone());
                 guard.1 = Arc::downgrade(&waker);
-                channel.waiting.push((waker, RecvState::Pending));
+                channel.waiting.insert(slot_at, (waker, RecvState::Pending));
                 self.0.nwaiting.fetch_add(1, Ordering::AcqRel);
 
                 // println!(
