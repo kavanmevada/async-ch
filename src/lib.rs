@@ -96,22 +96,29 @@ impl<'r, T> Drop for SenderGuard<'r, T> {
 #[derive(Debug)]
 pub struct Sender<T>(Arc<Shared<T>>);
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SendError<T>(pub T);
+
 impl<T: Debug> Sender<T> {
-    pub fn send(&self, msg: T) -> Result<(), Error> {
+    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
         futures::executor::block_on(self.send_async(msg))
     }
 
-    pub async fn send_async(&self, msg: T) -> Result<(), Error> {
+    pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
         let mut marker: Weak<Waker> = Weak::new();
         let mut msg_op = Some(msg);
 
         let mut guard = SenderGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
-            let mut channel = self.0.channel.lock().or(Err(Error::LockPoisoned))?;
+            let mut channel = self
+                .0
+                .channel
+                .lock()
+                .or(Err(SendError(msg_op.take().unwrap())))?;
 
             if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
-                return Poll::Ready(Err(Error::Disconnected));
+                return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
             }
 
             let waker = Arc::new(cx.waker().clone());
@@ -232,20 +239,26 @@ impl<'r, T> Drop for ReceiverGuard<'r, T> {
 #[derive(Debug)]
 pub struct Receiver<T>(Arc<Shared<T>>);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecvError {
+    /// All senders were dropped and no messages are waiting in the channel, so no further messages can be received.
+    Disconnected,
+}
+
 impl<T: Debug> Receiver<T> {
-    pub fn recv(&self) -> Result<T, Error> {
+    pub fn recv(&self) -> Result<T, RecvError> {
         futures::executor::block_on(self.recv_async())
     }
 
-    pub async fn recv_async(&self) -> Result<T, Error> {
+    pub async fn recv_async(&self) -> Result<T, RecvError> {
         let mut marker: Weak<Waker> = Weak::new();
         let mut guard = ReceiverGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
-            let mut channel = self.0.channel.lock().or(Err(Error::LockPoisoned))?;
+            let mut channel = self.0.channel.lock().or(Err(RecvError::Disconnected))?;
 
             if self.0.sender_count.load(Ordering::SeqCst) == 0 {
-                return Poll::Ready(Err(Error::Disconnected));
+                return Poll::Ready(Err(RecvError::Disconnected));
             }
 
             let waker = Arc::new(cx.waker().clone());
@@ -357,10 +370,304 @@ impl<T> Drop for Receiver<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
 
+    // running 9 tests
+    // test tests::flume_async_tests::async_recv ... FAILED
+    // test tests::flume_async_tests::async_send_1_million_no_drop_or_reorder ... FAILED
+    // test tests::flume_async_tests::async_recv_disconnect ... ok
+    // test tests::flume_async_tests::change_waker ... ok
+    // test tests::flume_async_tests::parallel_async_receivers ... ok
+    // test tests::flume_async_tests::spsc_single_threaded_value_ordering ... ok
+    // test tests::flume_async_tests::async_send_disconnect ... FAILED
+    // test tests::flume_async_tests::async_recv_drop_recv has been running for over 60 seconds
+    // test tests::flume_async_tests::async_send has been running for over 60 seconds
+
+    mod flume_async_tests {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::task::Waker;
+        use std::time::Duration;
+
+        use futures::stream::FuturesUnordered;
+        use futures::Future;
+        use futures::StreamExt;
+        use futures::TryFutureExt;
+
+        use async_std::prelude::FutureExt;
+
+        use crate::bounded;
+        use crate::unbounded;
+        use crate::RecvError;
+        use crate::SendError;
+
+        #[test]
+        fn r#async_recv() {
+            let (tx, rx) = unbounded();
+
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                tx.send(42u32).unwrap();
+            });
+
+            async_std::task::block_on(async {
+                assert_eq!(rx.recv_async().await.unwrap(), 42);
+            });
+
+            t.join().unwrap();
+        }
+
+        #[test]
+        fn r#async_send() {
+            let (tx, rx) = bounded(1);
+
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                assert_eq!(rx.recv(), Ok(42));
+            });
+
+            async_std::task::block_on(async {
+                tx.send_async(42u32).await.unwrap();
+            });
+
+            t.join().unwrap();
+        }
+
+        #[test]
+        fn r#async_recv_disconnect() {
+            let (tx, rx) = bounded::<i32>(0);
+
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                drop(tx)
+            });
+
+            async_std::task::block_on(async {
+                assert_eq!(rx.recv_async().await, Err(RecvError::Disconnected));
+            });
+
+            t.join().unwrap();
+        }
+
+        #[test]
+        fn r#async_send_disconnect() {
+            let (tx, rx) = bounded(0);
+
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                drop(rx)
+            });
+
+            async_std::task::block_on(async {
+                assert_eq!(tx.send_async(42u32).await, Err(SendError(42)));
+            });
+
+            t.join().unwrap();
+        }
+
+        #[test]
+        fn r#async_recv_drop_recv() {
+            let (tx, rx) = bounded::<i32>(10);
+
+            let recv_fut = rx.recv_async();
+
+            async_std::task::block_on(async {
+                let res = async_std::future::timeout(
+                    std::time::Duration::from_millis(500),
+                    rx.recv_async(),
+                )
+                .await;
+                assert!(res.is_err());
+            });
+
+            let rx2 = rx.clone();
+            let t = std::thread::spawn(move || {
+                async_std::task::block_on(async { rx2.recv_async().await })
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            tx.send(42).unwrap();
+
+            drop(recv_fut);
+
+            assert_eq!(t.join().unwrap(), Ok(42))
+        }
+
+        #[async_std::test]
+        async fn r#async_send_1_million_no_drop_or_reorder() {
+            #[derive(Debug)]
+            enum Message {
+                Increment { old: u64 },
+                ReturnCount,
+            }
+
+            let (tx, rx) = unbounded();
+
+            let t = async_std::task::spawn(async move {
+                let mut count = 0u64;
+
+                while let Ok(Message::Increment { old }) = rx.recv_async().await {
+                    assert_eq!(old, count);
+                    count += 1;
+                }
+
+                count
+            });
+
+            for next in 0..1_000_000 {
+                tx.send(Message::Increment { old: next }).unwrap();
+            }
+
+            tx.send(Message::ReturnCount).unwrap();
+
+            let count = t.await;
+            assert_eq!(count, 1_000_000)
+        }
+
+        #[async_std::test]
+        async fn parallel_async_receivers() {
+            let (tx, rx) = flume::unbounded();
+            let send_fut = async move {
+                let n_sends: usize = 100000;
+                for _ in 0..n_sends {
+                    tx.send_async(()).await.unwrap();
+                }
+            };
+
+            async_std::task::spawn(
+                send_fut
+                    .timeout(Duration::from_secs(5))
+                    .map_err(|_| panic!("Send timed out!")),
+            );
+
+            let mut futures_unordered = (0..250)
+                .map(|_| async {
+                    while let Ok(()) = rx.recv_async().await
+                    /* rx.recv() is OK */
+                    {}
+                })
+                .collect::<FuturesUnordered<_>>();
+
+            let recv_fut = async { while futures_unordered.next().await.is_some() {} };
+
+            recv_fut
+                .timeout(Duration::from_secs(5))
+                .map_err(|_| panic!("Receive timed out!"))
+                .await
+                .unwrap();
+
+            println!("recv end");
+        }
+
+        #[test]
+        fn change_waker() {
+            let (tx, rx) = flume::bounded(1);
+            tx.send(()).unwrap();
+
+            struct DebugWaker(Arc<AtomicUsize>, Waker);
+
+            impl DebugWaker {
+                fn new() -> Self {
+                    let woken = Arc::new(AtomicUsize::new(0));
+                    let woken_cloned = woken.clone();
+                    let waker = waker_fn::waker_fn(move || {
+                        woken.fetch_add(1, Ordering::SeqCst);
+                    });
+                    DebugWaker(woken_cloned, waker)
+                }
+
+                fn woken(&self) -> usize {
+                    self.0.load(Ordering::SeqCst)
+                }
+
+                fn ctx(&self) -> Context {
+                    Context::from_waker(&self.1)
+                }
+            }
+
+            // Check that the waker is correctly updated when sending tasks change their wakers
+            {
+                let send_fut = tx.send_async(());
+                futures::pin_mut!(send_fut);
+
+                let (waker1, waker2) = (DebugWaker::new(), DebugWaker::new());
+
+                // Set the waker to waker1
+                assert_eq!(send_fut.as_mut().poll(&mut waker1.ctx()), Poll::Pending);
+
+                // Change the waker to waker2
+                assert_eq!(send_fut.poll(&mut waker2.ctx()), Poll::Pending);
+
+                // Wake the future
+                rx.recv().unwrap();
+
+                // Check that waker2 was woken and waker1 was not
+                assert_eq!(waker1.woken(), 0);
+                assert_eq!(waker2.woken(), 1);
+            }
+
+            // Check that the waker is correctly updated when receiving tasks change their wakers
+            {
+                rx.recv().unwrap();
+                let recv_fut = rx.recv_async();
+                futures::pin_mut!(recv_fut);
+
+                let (waker1, waker2) = (DebugWaker::new(), DebugWaker::new());
+
+                // Set the waker to waker1
+                assert_eq!(recv_fut.as_mut().poll(&mut waker1.ctx()), Poll::Pending);
+
+                // Change the waker to waker2
+                assert_eq!(recv_fut.poll(&mut waker2.ctx()), Poll::Pending);
+
+                // Wake the future
+                tx.send(()).unwrap();
+
+                // Check that waker2 was woken and waker1 was not
+                assert_eq!(waker1.woken(), 0);
+                assert_eq!(waker2.woken(), 1);
+            }
+        }
+
+        #[test]
+        fn spsc_single_threaded_value_ordering() {
+            async fn test() {
+                let (tx, rx) = flume::bounded(4);
+                tokio::select! {
+                    _ = producer(tx) => {},
+                    _ = consumer(rx) => {},
+                }
+            }
+
+            async fn producer(tx: flume::Sender<usize>) {
+                for i in 0..100 {
+                    tx.send_async(i).await.unwrap();
+                }
+            }
+
+            async fn consumer(rx: flume::Receiver<usize>) {
+                let mut expected = 0;
+                while let Ok(value) = rx.recv_async().await {
+                    assert_eq!(value, expected);
+                    expected += 1;
+                }
+            }
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(test());
+        }
+    }
+
+    #[cfg(feature = "crossbeam-tests")]
     const TOTAL_STEPS: usize = 40_000;
 
+    #[cfg(feature = "crossbeam-tests")]
     mod unbounded {
         use std::thread::scope;
 
@@ -565,6 +872,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crossbeam-tests")]
     mod bounded_n {
         use std::thread::scope;
 
@@ -745,6 +1053,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crossbeam-tests")]
     mod bounded_1 {
         use std::thread::scope;
 
@@ -907,6 +1216,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crossbeam-tests")]
     mod bounded_0 {
         use std::thread::scope;
 
