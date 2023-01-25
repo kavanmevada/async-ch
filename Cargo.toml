@@ -7,17 +7,17 @@ edition = "2021"
 
 
 [dependencies]
-futures-lite = { version = "*" }
+futures = { version = "^0.3", features = ["std"] }
 
 [dev-dependencies]
 flume = "*"
-criterion = { version = "0.3.4", features = ["async_futures"] }
+# criterion = { version = "0.3.4", features = ["async_futures"] }
 async-std = { version = "1.9.0", features = ["attributes", "unstable"] }
 futures = { version = "^0.3", features = ["std"] }
 tokio = { version = "^1.16.1", features = ["rt", "macros"] }
 num_cpus = "1.13.0"
 waker-fn = "1.1.0"
 
-[[bench]]
-name = "basic"
-harness = false
+# [[bench]]
+# name = "basic"
+# harness = false

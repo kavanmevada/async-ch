@@ -2,99 +2,693 @@
 
 extern crate test;
 
+use async_ch::{bounded, unbounded};
+use std::thread::scope;
 use test::Bencher;
 
 const TOTAL_STEPS: usize = 40_000;
 
-#[macro_use]
-extern crate criterion;
+mod unbounded {
+    use super::*;
 
-use criterion::black_box;
-use criterion::*;
-use std::time::Instant;
+    #[bench]
+    fn create(b: &mut Bencher) {
+        b.iter(unbounded::<i32>);
+    }
 
-use async_std::prelude::FutureExt;
-use async_std::stream::StreamExt;
-use futures::stream::FuturesUnordered;
-use futures::Future;
-use futures::TryFutureExt;
-use std::task::Context;
-use std::time::Duration;
+    #[bench]
+    fn oneshot(b: &mut Bencher) {
+        b.iter(|| {
+            let (s, r) = unbounded::<i32>();
+            s.send(0).unwrap();
+            r.recv().unwrap();
+        });
+    }
 
-// The function to benchmark
-fn parallel_async_receivers_flume(c: &mut Criterion) {
-    let size: usize = TOTAL_STEPS;
+    #[bench]
+    fn inout(b: &mut Bencher) {
+        let (s, r) = unbounded::<i32>();
+        b.iter(|| {
+            s.send(0).unwrap();
+            r.recv().unwrap();
+        });
+    }
 
-    c.bench_with_input(
-        BenchmarkId::new("async_parallel_receive_flume", size),
-        &size,
-        |b, &s| {
-            // Insert a call to `to_async` to convert the bencher to async mode.
-            // The timing loops are the same as with the normal bencher.
-            b.to_async(criterion::async_executor::FuturesExecutor)
-                .iter(|| async {
-                    let (tx, rx) = flume::unbounded();
+    #[bench]
+    fn par_inout(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = unbounded::<i32>();
 
-                    let send_fut = async move {
-                        for _ in 0..s {
-                            rx.recv_async().await.unwrap();
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                            r.recv().unwrap();
                         }
-                    };
-
-                    async_std::task::spawn(send_fut);
-
-                    let mut futures_unordered = (0..250)
-                        .map(|_| async {
-                            while let Ok(()) = tx.send_async(()).await
-                            /* rx.recv() is OK */
-                            {}
-                        })
-                        .collect::<FuturesUnordered<_>>();
-
-                    while futures_unordered.next().await.is_some() {}
+                        s2.send(()).unwrap();
+                    }
                 });
-        },
-    );
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn spsc(b: &mut Bencher) {
+        let steps = TOTAL_STEPS;
+        let (s, r) = unbounded::<i32>();
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            scope.spawn(|| {
+                while r1.recv().is_ok() {
+                    for i in 0..steps {
+                        s.send(i as i32).unwrap();
+                    }
+                    s2.send(()).unwrap();
+                }
+            });
+
+            b.iter(|| {
+                s1.send(()).unwrap();
+                for _ in 0..steps {
+                    r.recv().unwrap();
+                }
+                r2.recv().unwrap();
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn spmc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = unbounded::<i32>();
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for i in 0..steps * threads {
+                    s.send(i as i32).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpsc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = unbounded::<i32>();
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..steps * threads {
+                    r.recv().unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = unbounded::<i32>();
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
 }
 
-fn parallel_async_receivers_async_ch(c: &mut Criterion) {
-    let size: usize = TOTAL_STEPS;
+mod bounded_n {
+    use super::*;
 
-    c.bench_with_input(
-        BenchmarkId::new("BM_parallel_receive_async_ch", size),
-        &size,
-        |b, &s| {
-            // Insert a call to `to_async` to convert the bencher to async mode.
-            // The timing loops are the same as with the normal bencher.
-            b.to_async(criterion::async_executor::FuturesExecutor)
-                .iter(|| async {
-                    let (tx, rx) = async_ch::unbounded();
+    #[bench]
+    fn spsc(b: &mut Bencher) {
+        let steps = TOTAL_STEPS;
+        let (s, r) = bounded::<i32>(steps);
 
-                    let send_fut = async move {
-                        for _ in 0..s {
-                            rx.recv_async().await.unwrap();
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            scope.spawn(|| {
+                while r1.recv().is_ok() {
+                    for i in 0..steps {
+                        s.send(i as i32).unwrap();
+                    }
+                    s2.send(()).unwrap();
+                }
+            });
+
+            b.iter(|| {
+                s1.send(()).unwrap();
+                for _ in 0..steps {
+                    r.recv().unwrap();
+                }
+                r2.recv().unwrap();
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn spmc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(steps * threads);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
                         }
-                    };
-
-                    async_std::task::spawn(send_fut);
-
-                    let mut futures_unordered = (0..250)
-                        .map(|_| async {
-                            while let Ok(()) = tx.send_async(()).await
-                            /* rx.recv() is OK */
-                            {}
-                        })
-                        .collect::<FuturesUnordered<_>>();
-
-                    while futures_unordered.next().await.is_some() {}
+                        s2.send(()).unwrap();
+                    }
                 });
-        },
-    );
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for i in 0..steps * threads {
+                    s.send(i as i32).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpsc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(steps * threads);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..steps * threads {
+                    r.recv().unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn par_inout(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(threads);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        assert_eq!(threads % 2, 0);
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(steps * threads);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
 }
 
-criterion_group!(
-    benches,
-    parallel_async_receivers_async_ch,
-    parallel_async_receivers_flume
-);
-criterion_main!(benches);
+mod bounded_1 {
+    use super::*;
+
+    #[bench]
+    fn create(b: &mut Bencher) {
+        b.iter(|| bounded::<i32>(1));
+    }
+
+    #[bench]
+    fn oneshot(b: &mut Bencher) {
+        b.iter(|| {
+            let (s, r) = bounded::<i32>(1);
+            s.send(0).unwrap();
+            r.recv().unwrap();
+        });
+    }
+
+    #[bench]
+    fn spsc(b: &mut Bencher) {
+        let steps = TOTAL_STEPS;
+        let (s, r) = bounded::<i32>(1);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            scope.spawn(|| {
+                while r1.recv().is_ok() {
+                    for i in 0..steps {
+                        s.send(i as i32).unwrap();
+                    }
+                    s2.send(()).unwrap();
+                }
+            });
+
+            b.iter(|| {
+                s1.send(()).unwrap();
+                for _ in 0..steps {
+                    r.recv().unwrap();
+                }
+                r2.recv().unwrap();
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn spmc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(1);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for i in 0..steps * threads {
+                    s.send(i as i32).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpsc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(1);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..steps * threads {
+                    r.recv().unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(1);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+}
+
+mod bounded_0 {
+    use super::*;
+
+    #[bench]
+    fn create(b: &mut Bencher) {
+        b.iter(|| bounded::<i32>(0));
+    }
+
+    #[bench]
+    fn spsc(b: &mut Bencher) {
+        let steps = TOTAL_STEPS;
+        let (s, r) = bounded::<i32>(0);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            scope.spawn(|| {
+                while r1.recv().is_ok() {
+                    for i in 0..steps {
+                        s.send(i as i32).unwrap();
+                    }
+                    s2.send(()).unwrap();
+                }
+            });
+
+            b.iter(|| {
+                s1.send(()).unwrap();
+                for _ in 0..steps {
+                    r.recv().unwrap();
+                }
+                r2.recv().unwrap();
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn spmc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(0);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for i in 0..steps * threads {
+                    s.send(i as i32).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpsc(b: &mut Bencher) {
+        let threads = num_cpus::get() - 1;
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(0);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..steps * threads {
+                    r.recv().unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = bounded::<i32>(0);
+
+        let (s1, r1) = bounded(0);
+        let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+}
