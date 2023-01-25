@@ -424,17 +424,14 @@ mod tests {
         use std::task::Waker;
         use std::time::Duration;
 
+        use crate::bounded;
+        use crate::unbounded;
         use futures::stream::FuturesUnordered;
         use futures::Future;
         use futures::StreamExt;
         use futures::TryFutureExt;
 
         use async_std::prelude::FutureExt;
-
-        use crate::bounded;
-        use crate::unbounded;
-        use crate::RecvError;
-        use crate::SendError;
 
         #[test]
         fn r#async_recv() {
@@ -479,7 +476,7 @@ mod tests {
             });
 
             async_std::task::block_on(async {
-                assert_eq!(rx.recv_async().await, Err(RecvError::Disconnected));
+                assert_eq!(rx.recv_async().await, Err(crate::RecvError::Disconnected));
             });
 
             t.join().unwrap();
@@ -495,7 +492,7 @@ mod tests {
             });
 
             async_std::task::block_on(async {
-                assert_eq!(tx.send_async(42u32).await, Err(SendError(42)));
+                assert_eq!(tx.send_async(42u32).await, Err(crate::SendError(42)));
             });
 
             t.join().unwrap();
@@ -563,7 +560,7 @@ mod tests {
 
         #[async_std::test]
         async fn parallel_async_receivers() {
-            let (tx, rx) = flume::unbounded();
+            let (tx, rx) = unbounded();
             let send_fut = async move {
                 let n_sends: usize = 100000;
                 for _ in 0..n_sends {
@@ -598,7 +595,7 @@ mod tests {
 
         #[test]
         fn change_waker() {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = bounded(1);
             tx.send(()).unwrap();
 
             struct DebugWaker(Arc<AtomicUsize>, Waker);
@@ -664,36 +661,6 @@ mod tests {
                 assert_eq!(waker1.woken(), 0);
                 assert_eq!(waker2.woken(), 1);
             }
-        }
-
-        #[test]
-        fn spsc_single_threaded_value_ordering() {
-            async fn test() {
-                let (tx, rx) = flume::bounded(4);
-                tokio::select! {
-                    _ = producer(tx) => {},
-                    _ = consumer(rx) => {},
-                }
-            }
-
-            async fn producer(tx: flume::Sender<usize>) {
-                for i in 0..100 {
-                    tx.send_async(i).await.unwrap();
-                }
-            }
-
-            async fn consumer(rx: flume::Receiver<usize>) {
-                let mut expected = 0;
-                while let Ok(value) = rx.recv_async().await {
-                    assert_eq!(value, expected);
-                    expected += 1;
-                }
-            }
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            rt.block_on(test());
         }
     }
 

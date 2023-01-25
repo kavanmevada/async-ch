@@ -206,6 +206,48 @@ mod unbounded {
             drop(s1);
         });
     }
+
+    #[bench]
+    fn mpmc_flume(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = flume::unbounded::<i32>();
+
+        let (s1, r1) = flume::bounded(0);
+        let (s2, r2) = flume::bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
 }
 
 mod bounded_n {
@@ -351,6 +393,49 @@ mod bounded_n {
 
         let (s1, r1) = bounded(0);
         let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc_flume(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        assert_eq!(threads % 2, 0);
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = flume::bounded::<i32>(steps * threads);
+
+        let (s1, r1) = flume::bounded(0);
+        let (s2, r2) = flume::bounded(0);
         scope(|scope| {
             for _ in 0..threads / 2 {
                 scope.spawn(|| {
@@ -542,6 +627,48 @@ mod bounded_1 {
             drop(s1);
         });
     }
+
+    #[bench]
+    fn mpmc_flume(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = flume::bounded::<i32>(1);
+
+        let (s1, r1) = flume::bounded(0);
+        let (s2, r2) = flume::bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
 }
 
 mod bounded_0 {
@@ -658,6 +785,48 @@ mod bounded_0 {
 
         let (s1, r1) = bounded(0);
         let (s2, r2) = bounded(0);
+        scope(|scope| {
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for i in 0..steps {
+                            s.send(i as i32).unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+            for _ in 0..threads / 2 {
+                scope.spawn(|| {
+                    while r1.recv().is_ok() {
+                        for _ in 0..steps {
+                            r.recv().unwrap();
+                        }
+                        s2.send(()).unwrap();
+                    }
+                });
+            }
+
+            b.iter(|| {
+                for _ in 0..threads {
+                    s1.send(()).unwrap();
+                }
+                for _ in 0..threads {
+                    r2.recv().unwrap();
+                }
+            });
+            drop(s1);
+        });
+    }
+
+    #[bench]
+    fn mpmc_flume(b: &mut Bencher) {
+        let threads = num_cpus::get();
+        let steps = TOTAL_STEPS / threads;
+        let (s, r) = flume::bounded::<i32>(0);
+
+        let (s1, r1) = flume::bounded(0);
+        let (s2, r2) = flume::bounded(0);
         scope(|scope| {
             for _ in 0..threads / 2 {
                 scope.spawn(|| {
