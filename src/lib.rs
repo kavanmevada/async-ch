@@ -17,12 +17,14 @@ pub enum Error {
 pub enum SendState<T> {
     Pending(Option<T>),
     Done,
+    Cancelled,
 }
 
 #[derive(Debug)]
 pub enum RecvState<T> {
     Pending,
     Done(Option<T>),
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -86,9 +88,14 @@ pub struct SenderGuard<'r, T>(&'r Arc<Shared<T>>, Weak<Waker>);
 impl<'r, T> Drop for SenderGuard<'r, T> {
     fn drop(&mut self) {
         self.0.channel.lock().map_or((), |mut channel| {
-            channel
+            if let Some((w, state)) = channel
                 .sending
-                .retain(|(w, _)| !Arc::downgrade(w).ptr_eq(&self.1))
+                .iter_mut()
+                .find(|(w, _)| Arc::downgrade(w).ptr_eq(&self.1))
+            {
+                *state = SendState::Cancelled;
+                w.wake_by_ref();
+            }
         });
     }
 }
@@ -111,15 +118,7 @@ impl<T: Debug> Sender<T> {
         let mut guard = SenderGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
-            let mut channel = self
-                .0
-                .channel
-                .lock()
-                .or(Err(SendError(msg_op.take().unwrap())))?;
-
-            if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
-                return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
-            }
+            let mut channel = self.0.channel.lock().expect("poison error");
 
             let waker = Arc::new(cx.waker().clone());
 
@@ -145,14 +144,31 @@ impl<T: Debug> Sender<T> {
                 // Second Poll
 
                 match state {
-                    SendState::Pending(_) => {
-                        *w = waker;
+                    SendState::Pending(msg_op) => {
+                        if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
+                            Poll::Ready(Err(SendError(msg_op.take().unwrap())))
+                        } else {
+                            marker = Arc::downgrade(&waker);
+                            guard.1 = Arc::downgrade(&waker);
+                            *w = waker;
 
-                        // println!("snd: waker updated");
+                            // println!("snd: waker updated");
 
-                        Poll::Pending
+                            Poll::Pending
+                        }
                     }
                     SendState::Done => {
+                        channel.sending.remove(pos);
+
+                        // println!(
+                        //     "{:?}: send(after) SendState::Done so removed {:?}",
+                        //     std::thread::current().id(),
+                        //     &channel
+                        // );
+
+                        Poll::Ready(Ok(()))
+                    }
+                    SendState::Cancelled => {
                         channel.sending.remove(pos);
 
                         // println!(
@@ -180,6 +196,10 @@ impl<T: Debug> Sender<T> {
 
                         return Poll::Ready(Ok(()));
                     }
+                }
+
+                if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
+                    return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
                 }
 
                 if channel.queue.len() < channel.length {
@@ -229,9 +249,14 @@ pub struct ReceiverGuard<'r, T>(&'r Arc<Shared<T>>, Weak<Waker>);
 impl<'r, T> Drop for ReceiverGuard<'r, T> {
     fn drop(&mut self) {
         self.0.channel.lock().map_or((), |mut channel| {
-            channel
+            if let Some((w, state)) = channel
                 .waiting
-                .retain(|(w, _)| !Arc::downgrade(w).ptr_eq(&self.1))
+                .iter_mut()
+                .find(|(w, _)| Arc::downgrade(w).ptr_eq(&self.1))
+            {
+                *state = RecvState::Cancelled;
+                w.wake_by_ref();
+            }
         });
     }
 }
@@ -243,6 +268,7 @@ pub struct Receiver<T>(Arc<Shared<T>>);
 pub enum RecvError {
     /// All senders were dropped and no messages are waiting in the channel, so no further messages can be received.
     Disconnected,
+    Cancelled,
 }
 
 impl<T: Debug> Receiver<T> {
@@ -256,10 +282,6 @@ impl<T: Debug> Receiver<T> {
 
         core::future::poll_fn(|cx| {
             let mut channel = self.0.channel.lock().or(Err(RecvError::Disconnected))?;
-
-            if self.0.sender_count.load(Ordering::SeqCst) == 0 {
-                return Poll::Ready(Err(RecvError::Disconnected));
-            }
 
             let waker = Arc::new(cx.waker().clone());
 
@@ -286,15 +308,21 @@ impl<T: Debug> Receiver<T> {
 
                 match state {
                     RecvState::Pending => {
-                        *w = waker;
+                        if self.0.sender_count.load(Ordering::SeqCst) == 0 {
+                            Poll::Ready(Err(RecvError::Disconnected))
+                        } else {
+                            marker = Arc::downgrade(&waker);
+                            guard.1 = Arc::downgrade(&waker);
+                            *w = waker;
 
-                        // println!(
-                        //     "{:?} waker updated in recv_async {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
+                            // println!(
+                            //     "{:?} waker updated in recv_async {:?}",
+                            //     std::thread::current().id(),
+                            //     &channel
+                            // );
 
-                        Poll::Pending
+                            Poll::Pending
+                        }
                     }
                     RecvState::Done(msg_op) => {
                         let msg_op = msg_op.take();
@@ -306,6 +334,16 @@ impl<T: Debug> Receiver<T> {
                         // );
 
                         Poll::Ready(Ok(msg_op.unwrap()))
+                    }
+                    RecvState::Cancelled => {
+                        channel.waiting.remove(pos);
+                        // println!(
+                        //     "{:?}: recv(after) removed from waiting by receiver {:?}",
+                        //     std::thread::current().id(),
+                        //     &channel
+                        // );
+
+                        Poll::Ready(Err(RecvError::Cancelled))
                     }
                 }
             } else {
@@ -325,6 +363,10 @@ impl<T: Debug> Receiver<T> {
 
                         return Poll::Ready(Ok(msg));
                     }
+                }
+
+                if self.0.sender_count.load(Ordering::SeqCst) == 0 {
+                    return Poll::Ready(Err(RecvError::Disconnected));
                 }
 
                 if !channel.queue.is_empty() {
@@ -370,19 +412,8 @@ impl<T> Drop for Receiver<T> {
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
 
-    // running 9 tests
-    // test tests::flume_async_tests::async_recv ... FAILED
-    // test tests::flume_async_tests::async_send_1_million_no_drop_or_reorder ... FAILED
-    // test tests::flume_async_tests::async_recv_disconnect ... ok
-    // test tests::flume_async_tests::change_waker ... ok
-    // test tests::flume_async_tests::parallel_async_receivers ... ok
-    // test tests::flume_async_tests::spsc_single_threaded_value_ordering ... ok
-    // test tests::flume_async_tests::async_send_disconnect ... FAILED
-    // test tests::flume_async_tests::async_recv_drop_recv has been running for over 60 seconds
-    // test tests::flume_async_tests::async_send has been running for over 60 seconds
-
+    #[cfg(feature = "flume-tests")]
     mod flume_async_tests {
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
@@ -409,8 +440,9 @@ mod tests {
             let (tx, rx) = unbounded();
 
             let t = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 tx.send(42u32).unwrap();
+                println!("send done");
             });
 
             async_std::task::block_on(async {
@@ -457,7 +489,7 @@ mod tests {
             let (tx, rx) = bounded(0);
 
             let t = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 drop(rx)
             });
 
@@ -669,9 +701,10 @@ mod tests {
 
     #[cfg(feature = "crossbeam-tests")]
     mod unbounded {
+        use super::TOTAL_STEPS;
+        use crate::bounded;
+        use crate::unbounded;
         use std::thread::scope;
-
-        use super::*;
 
         #[test]
         fn create() {
@@ -874,9 +907,9 @@ mod tests {
 
     #[cfg(feature = "crossbeam-tests")]
     mod bounded_n {
+        use super::TOTAL_STEPS;
+        use crate::bounded;
         use std::thread::scope;
-
-        use super::*;
 
         #[test]
         fn spsc() {
@@ -1055,9 +1088,9 @@ mod tests {
 
     #[cfg(feature = "crossbeam-tests")]
     mod bounded_1 {
+        use super::TOTAL_STEPS;
+        use crate::bounded;
         use std::thread::scope;
-
-        use super::*;
 
         #[test]
         fn create() {
@@ -1218,9 +1251,9 @@ mod tests {
 
     #[cfg(feature = "crossbeam-tests")]
     mod bounded_0 {
+        use super::TOTAL_STEPS;
+        use crate::bounded;
         use std::thread::scope;
-
-        use super::*;
 
         #[test]
         fn create() {

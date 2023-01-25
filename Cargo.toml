@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+flume-tests=[]
+crossbeam-tests=[]
+default = ["flume-tests", "crossbeam-tests"]
 
 [dependencies]
 futures = { version = "^0.3", features = ["std"] }
