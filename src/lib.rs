@@ -2,7 +2,7 @@ use core::fmt::Debug;
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
     },
     task::{Poll, Waker},
@@ -41,21 +41,24 @@ pub struct Shared<T> {
     channel: Mutex<Channel<T>>,
     sender_count: AtomicUsize,
     receiver_count: AtomicUsize,
+
+    nsending: AtomicU8,
+    nwaiting: AtomicU8,
 }
 
 impl<T> Channel<T> {
     fn with_capacity(length: usize) -> Self {
         if length == usize::MAX {
             Self {
-                sending: Vec::default(),
-                waiting: Vec::default(),
+                sending: Vec::with_capacity(64),
+                waiting: Vec::with_capacity(64),
                 queue: VecDeque::default(),
                 length,
             }
         } else {
             Self {
-                sending: Vec::with_capacity(length),
-                waiting: Vec::with_capacity(length),
+                sending: Vec::with_capacity(64),
+                waiting: Vec::with_capacity(64),
                 queue: VecDeque::with_capacity(length),
                 length,
             }
@@ -68,6 +71,9 @@ pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
         channel: Mutex::new(Channel::with_capacity(cap)),
         sender_count: AtomicUsize::new(1),
         receiver_count: AtomicUsize::new(1),
+
+        nsending: AtomicU8::new(0),
+        nwaiting: AtomicU8::new(0),
     });
 
     (Sender(Arc::clone(&shared)), Receiver(Arc::clone(&shared)))
@@ -78,6 +84,9 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         channel: Mutex::new(Channel::with_capacity(usize::MAX)),
         sender_count: AtomicUsize::new(1),
         receiver_count: AtomicUsize::new(1),
+
+        nsending: AtomicU8::new(0),
+        nwaiting: AtomicU8::new(0),
     });
 
     (Sender(Arc::clone(&shared)), Receiver(Arc::clone(&shared)))
@@ -113,15 +122,12 @@ impl<T: Debug> Sender<T> {
     }
 
     pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
-        let mut marker: Weak<Waker> = Weak::new();
         let mut msg_op = Some(msg);
 
         let mut guard = SenderGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
             let mut channel = self.0.channel.lock().expect("poison error");
-
-            let waker = Arc::new(cx.waker().clone());
 
             // println!(
             //     "{:?}: send(before) {:?}",
@@ -135,7 +141,7 @@ impl<T: Debug> Sender<T> {
                     .iter_mut()
                     .enumerate()
                     .find_map(|(p, (w, s))| {
-                        if Arc::downgrade(w).ptr_eq(&marker) {
+                        if Arc::downgrade(w).ptr_eq(&guard.1) {
                             Some((p, w, s))
                         } else {
                             None
@@ -149,28 +155,20 @@ impl<T: Debug> Sender<T> {
                         if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
                             Poll::Ready(Err(SendError(msg_op.take().unwrap())))
                         } else {
-                            marker = Arc::downgrade(&waker);
-                            guard.1 = Arc::downgrade(&waker);
-                            *w = waker;
+                            let nwaker = cx.waker();
+                            if !w.will_wake(nwaker) {
+                                *w = Arc::new(nwaker.clone());
+                                guard.1 = Arc::downgrade(&w);
+                            }
 
                             // println!("snd: waker updated");
 
                             Poll::Pending
                         }
                     }
-                    SendState::Done => {
+                    SendState::Done | SendState::Cancelled => {
                         channel.sending.remove(pos);
-
-                        // println!(
-                        //     "{:?}: send(after) SendState::Done so removed {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        Poll::Ready(Ok(()))
-                    }
-                    SendState::Cancelled => {
-                        channel.sending.remove(pos);
+                        self.0.nsending.fetch_sub(1, Ordering::AcqRel);
 
                         // println!(
                         //     "{:?}: send(after) SendState::Done so removed {:?}",
@@ -183,6 +181,9 @@ impl<T: Debug> Sender<T> {
                 }
             } else {
                 // First Poll
+                if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
+                    return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
+                }
 
                 for (w, state) in channel.waiting.iter_mut() {
                     if let RecvState::Pending = state {
@@ -199,20 +200,19 @@ impl<T: Debug> Sender<T> {
                     }
                 }
 
-                if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
-                    return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
-                }
-
                 if channel.queue.len() < channel.length {
                     channel.queue.push_back(msg_op.take());
                     return Poll::Ready(Ok(()));
                 }
 
-                marker = Arc::downgrade(&waker);
+                let waker = Arc::new(cx.waker().clone());
                 guard.1 = Arc::downgrade(&waker);
+
                 channel
                     .sending
                     .push((waker, SendState::Pending(msg_op.take())));
+
+                self.0.nsending.fetch_add(1, Ordering::AcqRel);
 
                 // println!(
                 //     "{:?}: send(after) pending => {:?}",
@@ -236,10 +236,12 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        if self.0.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Ok(channel) = self.0.channel.lock() {
-                channel.waiting.iter().for_each(|(w, _)| w.wake_by_ref());
-            }
+        if self.0.sender_count.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.0.nwaiting.load(Ordering::SeqCst) > 0
+        {
+            self.0.channel.lock().map_or((), |channel| {
+                channel.waiting.iter().for_each(|(w, _)| w.wake_by_ref())
+            });
         }
     }
 }
@@ -278,13 +280,10 @@ impl<T: Debug> Receiver<T> {
     }
 
     pub async fn recv_async(&self) -> Result<T, RecvError> {
-        let mut marker: Weak<Waker> = Weak::new();
         let mut guard = ReceiverGuard(&self.0, Weak::new());
 
         core::future::poll_fn(|cx| {
             let mut channel = self.0.channel.lock().or(Err(RecvError::Disconnected))?;
-
-            let waker = Arc::new(cx.waker().clone());
 
             // println!(
             //     "{:?}: recv(before) {:?}",
@@ -298,7 +297,7 @@ impl<T: Debug> Receiver<T> {
                     .iter_mut()
                     .enumerate()
                     .find_map(|(p, (w, s))| {
-                        if Arc::downgrade(w).ptr_eq(&marker) {
+                        if Arc::downgrade(w).ptr_eq(&guard.1) {
                             Some((p, w, s))
                         } else {
                             None
@@ -312,9 +311,11 @@ impl<T: Debug> Receiver<T> {
                         if self.0.sender_count.load(Ordering::SeqCst) == 0 {
                             Poll::Ready(Err(RecvError::Disconnected))
                         } else {
-                            marker = Arc::downgrade(&waker);
-                            guard.1 = Arc::downgrade(&waker);
-                            *w = waker;
+                            let nwaker = cx.waker();
+                            if !w.will_wake(nwaker) {
+                                *w = Arc::new(nwaker.clone());
+                                guard.1 = Arc::downgrade(&w);
+                            }
 
                             // println!(
                             //     "{:?} waker updated in recv_async {:?}",
@@ -328,6 +329,7 @@ impl<T: Debug> Receiver<T> {
                     RecvState::Done(msg_op) => {
                         let msg_op = msg_op.take();
                         channel.waiting.remove(pos);
+                        self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
                         // println!(
                         //     "{:?}: recv(after) removed from waiting by receiver {:?}",
                         //     std::thread::current().id(),
@@ -338,6 +340,7 @@ impl<T: Debug> Receiver<T> {
                     }
                     RecvState::Cancelled => {
                         channel.waiting.remove(pos);
+                        self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
                         // println!(
                         //     "{:?}: recv(after) removed from waiting by receiver {:?}",
                         //     std::thread::current().id(),
@@ -349,6 +352,9 @@ impl<T: Debug> Receiver<T> {
                 }
             } else {
                 // First Poll
+                if self.0.sender_count.load(Ordering::SeqCst) == 0 {
+                    return Poll::Ready(Err(RecvError::Disconnected));
+                }
 
                 for (w, state) in channel.sending.iter_mut() {
                     if let SendState::Pending(msg_op) = state {
@@ -366,19 +372,16 @@ impl<T: Debug> Receiver<T> {
                     }
                 }
 
-                if self.0.sender_count.load(Ordering::SeqCst) == 0 {
-                    return Poll::Ready(Err(RecvError::Disconnected));
-                }
-
                 if !channel.queue.is_empty() {
                     if let Some(Some(msg)) = channel.queue.pop_front() {
                         return Poll::Ready(Ok(msg));
                     }
                 }
 
-                marker = Arc::downgrade(&waker);
+                let waker = Arc::new(cx.waker().clone());
                 guard.1 = Arc::downgrade(&waker);
                 channel.waiting.push((waker, RecvState::Pending));
+                self.0.nwaiting.fetch_add(1, Ordering::AcqRel);
 
                 // println!(
                 //     "{:?}: recv(after) pending {:?}",
@@ -402,7 +405,9 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if self.0.receiver_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.0.receiver_count.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.0.nsending.load(Ordering::SeqCst) > 0
+        {
             self.0
                 .channel
                 .lock()

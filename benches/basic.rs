@@ -6,7 +6,7 @@ use async_ch::{bounded, unbounded};
 use std::thread::scope;
 use test::Bencher;
 
-const TOTAL_STEPS: usize = 40_000;
+const TOTAL_STEPS: usize = 1_000;
 
 mod unbounded {
     use super::*;
