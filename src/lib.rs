@@ -1,9 +1,9 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, future::Future};
 use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     task::{Poll, Waker},
 };
@@ -15,23 +15,16 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-pub enum SendState<T> {
-    Pending(Option<T>),
-    Done,
-    Cancelled,
-}
-
-#[derive(Debug)]
-pub enum RecvState<T> {
-    Pending,
-    Done(Option<T>),
+pub enum Item<T> {
+    Occupied(Option<T>),
+    Empty,
     Cancelled,
 }
 
 #[derive(Debug)]
 pub struct Channel<T> {
-    sending: Vec<(Arc<Waker>, SendState<T>)>,
-    waiting: Vec<(Arc<Waker>, RecvState<T>)>,
+    sending: Vec<(Waker, Item<T>)>,
+    waiting: Vec<(Waker, Item<T>)>,
     queue: VecDeque<Option<T>>,
     length: usize,
 }
@@ -47,66 +40,127 @@ pub struct Shared<T> {
 }
 
 impl<T> Channel<T> {
-    fn with_capacity(length: usize) -> Self {
-        if length == usize::MAX {
-            Self {
-                sending: Vec::with_capacity(32),
-                waiting: Vec::with_capacity(32),
-                queue: VecDeque::default(),
-                length,
-            }
-        } else {
-            Self {
-                sending: Vec::with_capacity(32),
-                waiting: Vec::with_capacity(32),
-                queue: VecDeque::with_capacity(length),
-                length,
-            }
-        }
+    fn with_capacity(length: usize) -> (Sender<T>, Receiver<T>) {
+        let channel = Self {
+            sending: Vec::with_capacity(32),
+            waiting: Vec::with_capacity(32),
+            queue: if length == usize::MAX {
+                VecDeque::new()
+            } else {
+                VecDeque::with_capacity(length)
+            },
+            length,
+        };
+
+        let shared = Arc::new(Shared {
+            channel: Mutex::new(channel),
+            sender_count: AtomicUsize::new(1),
+            receiver_count: AtomicUsize::new(1),
+
+            nsending: AtomicU8::new(0),
+            nwaiting: AtomicU8::new(0),
+        });
+
+        (Sender(Arc::clone(&shared)), Receiver(Arc::clone(&shared)))
     }
 }
 
 pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        channel: Mutex::new(Channel::with_capacity(cap)),
-        sender_count: AtomicUsize::new(1),
-        receiver_count: AtomicUsize::new(1),
-
-        nsending: AtomicU8::new(0),
-        nwaiting: AtomicU8::new(0),
-    });
-
-    (Sender(Arc::clone(&shared)), Receiver(Arc::clone(&shared)))
+    Channel::with_capacity(cap)
 }
 
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        channel: Mutex::new(Channel::with_capacity(usize::MAX)),
-        sender_count: AtomicUsize::new(1),
-        receiver_count: AtomicUsize::new(1),
-
-        nsending: AtomicU8::new(0),
-        nwaiting: AtomicU8::new(0),
-    });
-
-    (Sender(Arc::clone(&shared)), Receiver(Arc::clone(&shared)))
+    Channel::with_capacity(usize::MAX)
 }
 
-#[derive(Debug)]
-pub struct SenderGuard<'r, T>(&'r Arc<Shared<T>>, Weak<Waker>);
+pub struct SendFut<'s, T> {
+    sender: &'s Sender<T>,
+    msg_op: Option<T>,
+    waker_op: Option<Waker>,
+}
 
-impl<'r, T> Drop for SenderGuard<'r, T> {
+impl<'s, T> Drop for SendFut<'s, T> {
     fn drop(&mut self) {
-        self.0.channel.lock().map_or((), |mut channel| {
+        self.sender.0.channel.lock().map_or((), |mut channel| {
             if let Some((w, state)) = channel
                 .sending
                 .iter_mut()
-                .find(|(w, _)| std::ptr::eq(&**w, self.1.as_ptr()))
+                .find(|(a, _)| self.waker_op.as_ref().map_or(false, |b| a.will_wake(&b)))
             {
-                *state = SendState::Cancelled;
+                *state = Item::Cancelled;
                 w.wake_by_ref();
             }
         });
+    }
+}
+
+impl<'s, T> Unpin for SendFut<'s, T> {}
+
+impl<'s, T> Future for SendFut<'s, T> {
+    type Output = Result<(), SendError<T>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let mut channel = self.sender.0.channel.lock().expect("poison error");
+
+        if let Some((slot_at, (w, state))) = channel
+            .sending
+            .iter_mut()
+            .enumerate()
+            .find(|(_, (a, _))| self.waker_op.as_ref().map_or(false, |b| a.will_wake(&b)))
+        {
+            match state {
+                Item::Occupied(msg_op) => {
+                    if self.sender.0.receiver_count.load(Ordering::SeqCst) == 0 {
+                        Poll::Ready(Err(SendError(msg_op.take().unwrap())))
+                    } else {
+                        if !w.will_wake(cx.waker()) {
+                            *w = cx.waker().clone();
+                            self.waker_op = Some(w.clone());
+                        }
+
+                        Poll::Pending
+                    }
+                }
+                Item::Empty | Item::Cancelled => {
+                    channel.sending.swap_remove(slot_at);
+                    self.sender.0.nsending.fetch_sub(1, Ordering::AcqRel);
+
+                    Poll::Ready(Ok(()))
+                }
+            }
+        } else {
+            if self.sender.0.receiver_count.load(Ordering::SeqCst) == 0 {
+                return Poll::Ready(Err(SendError(self.msg_op.take().unwrap())));
+            }
+
+            for (w, state) in channel.waiting.iter_mut() {
+                if let Item::Empty = state {
+                    *state = Item::Occupied(self.msg_op.take());
+                    w.wake_by_ref();
+
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            if channel.queue.len() < channel.length {
+                channel.queue.push_back(self.msg_op.take());
+                return Poll::Ready(Ok(()));
+            }
+
+            let waker = cx.waker().clone();
+            self.waker_op = Some(waker.clone());
+
+            channel
+                .sending
+                .push((waker, Item::Occupied(self.msg_op.take())));
+
+            self.sender.0.nsending.fetch_add(1, Ordering::AcqRel);
+
+            Poll::Pending
+        }
     }
 }
 
@@ -118,104 +172,19 @@ pub struct SendError<T>(pub T);
 
 impl<T: Debug> Sender<T> {
     pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        futures_lite::future::block_on(self.send_async(msg))
+        futures_lite::future::block_on(SendFut {
+            sender: &self,
+            msg_op: Some(msg),
+            waker_op: None,
+        })
     }
 
     pub async fn send_async(&self, msg: T) -> Result<(), SendError<T>> {
-        let mut msg_op = Some(msg);
-
-        let mut guard = SenderGuard(&self.0, Weak::new());
-
-        core::future::poll_fn(|cx| {
-            let mut channel = self.0.channel.lock().expect("poison error");
-
-            // println!(
-            //     "{:?}: send(before) {:?}",
-            //     std::thread::current().id(),
-            //     channel
-            // );
-
-            let slot_at = *channel
-                .sending
-                .iter()
-                .position(|(w, _)| core::ptr::eq(&**w, guard.1.as_ptr()))
-                .get_or_insert(channel.sending.len());
-
-            if let Some((w, state)) = channel.sending.get_mut(slot_at) {
-                // Second Poll
-                match state {
-                    SendState::Pending(msg_op) => {
-                        if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
-                            Poll::Ready(Err(SendError(msg_op.take().unwrap())))
-                        } else {
-                            let nwaker = cx.waker();
-                            if !w.will_wake(nwaker) {
-                                *w = Arc::new(nwaker.clone());
-                                guard.1 = Arc::downgrade(&w);
-                            }
-
-                            // println!("snd: waker updated");
-
-                            Poll::Pending
-                        }
-                    }
-                    SendState::Done | SendState::Cancelled => {
-                        channel.sending.remove(slot_at);
-                        self.0.nsending.fetch_sub(1, Ordering::AcqRel);
-
-                        // println!(
-                        //     "{:?}: send(after) SendState::Done so removed {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        Poll::Ready(Ok(()))
-                    }
-                }
-            } else {
-                // First Poll
-                if self.0.receiver_count.load(Ordering::SeqCst) == 0 {
-                    return Poll::Ready(Err(SendError(msg_op.take().unwrap())));
-                }
-
-                for (w, state) in channel.waiting.iter_mut() {
-                    if let RecvState::Pending = state {
-                        *state = RecvState::Done(msg_op.take());
-                        w.wake_by_ref();
-
-                        // println!(
-                        //     "{:?} state replaced from waiting by sending {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-
-                if channel.queue.len() < channel.length {
-                    channel.queue.push_back(msg_op.take());
-                    return Poll::Ready(Ok(()));
-                }
-
-                let waker = Arc::new(cx.waker().clone());
-                guard.1 = Arc::downgrade(&waker);
-
-                channel
-                    .sending
-                    .insert(slot_at, (waker, SendState::Pending(msg_op.take())));
-
-                self.0.nsending.fetch_add(1, Ordering::AcqRel);
-
-                // println!(
-                //     "{:?}: send(after) pending => {:?}",
-                //     std::thread::current().id(),
-                //     &channel
-                // );
-
-                Poll::Pending
-            }
-        })
+        SendFut {
+            sender: &self,
+            msg_op: Some(msg),
+            waker_op: None,
+        }
         .await
     }
 }
@@ -240,25 +209,101 @@ impl<T> Drop for Sender<T> {
 }
 
 #[derive(Debug)]
-pub struct ReceiverGuard<'r, T>(&'r Arc<Shared<T>>, Weak<Waker>);
+pub struct Receiver<T>(Arc<Shared<T>>);
 
-impl<'r, T> Drop for ReceiverGuard<'r, T> {
+pub struct RecvFut<'s, T> {
+    receiver: &'s Receiver<T>,
+    waker_op: Option<Waker>,
+}
+
+impl<'s, T> Unpin for RecvFut<'s, T> {}
+
+impl<'s, T> Drop for RecvFut<'s, T> {
     fn drop(&mut self) {
-        self.0.channel.lock().map_or((), |mut channel| {
+        self.receiver.0.channel.lock().map_or((), |mut channel| {
             if let Some((w, state)) = channel
                 .waiting
                 .iter_mut()
-                .find(|(w, _)| std::ptr::eq(&**w, self.1.as_ptr()))
+                .find(|(a, _)| self.waker_op.as_ref().map_or(false, |b| a.will_wake(&b)))
             {
-                *state = RecvState::Cancelled;
+                *state = Item::Cancelled;
                 w.wake_by_ref();
             }
         });
     }
 }
 
-#[derive(Debug)]
-pub struct Receiver<T>(Arc<Shared<T>>);
+impl<'s, T> Future for RecvFut<'s, T> {
+    type Output = Result<T, RecvError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let mut channel = self.receiver.0.channel.lock().expect("poison error");
+
+        if let Some((slot_at, (w, state))) = channel
+            .waiting
+            .iter_mut()
+            .enumerate()
+            .find(|(_, (a, _))| self.waker_op.as_ref().map_or(false, |b| a.will_wake(&b)))
+        {
+            match state {
+                Item::Empty => {
+                    if self.receiver.0.sender_count.load(Ordering::SeqCst) == 0 {
+                        Poll::Ready(Err(RecvError::Disconnected))
+                    } else {
+                        let nwaker = cx.waker();
+                        if !w.will_wake(nwaker) {
+                            *w = nwaker.clone();
+                            self.waker_op = Some(w.clone());
+                        }
+
+                        Poll::Pending
+                    }
+                }
+                Item::Occupied(msg_op) => {
+                    let msg_op = msg_op.take();
+                    channel.waiting.swap_remove(slot_at);
+                    self.receiver.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
+
+                    Poll::Ready(Ok(msg_op.unwrap()))
+                }
+                Item::Cancelled => {
+                    channel.waiting.swap_remove(slot_at);
+                    self.receiver.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
+
+                    Poll::Ready(Err(RecvError::Cancelled))
+                }
+            }
+        } else {
+            if self.receiver.0.sender_count.load(Ordering::SeqCst) == 0 {
+                return Poll::Ready(Err(RecvError::Disconnected));
+            }
+
+            for (w, state) in channel.sending.iter_mut() {
+                if let Item::Occupied(msg_op) = state {
+                    let msg = msg_op.take().unwrap();
+                    *state = Item::Empty;
+                    w.wake_by_ref();
+
+                    return Poll::Ready(Ok(msg));
+                }
+            }
+
+            if let Some(Some(msg)) = channel.queue.swap_remove_front(0) {
+                return Poll::Ready(Ok(msg));
+            }
+
+            self.waker_op = Some(cx.waker().clone());
+            channel.waiting.push((cx.waker().clone(), Item::Empty));
+
+            self.receiver.0.nwaiting.fetch_add(1, Ordering::AcqRel);
+
+            Poll::Pending
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RecvError {
@@ -273,112 +318,10 @@ impl<T: Debug> Receiver<T> {
     }
 
     pub async fn recv_async(&self) -> Result<T, RecvError> {
-        let mut guard = ReceiverGuard(&self.0, Weak::new());
-
-        core::future::poll_fn(|cx| {
-            let mut channel = self.0.channel.lock().expect("poison error");
-
-            // println!(
-            //     "{:?}: recv(before) {:?}",
-            //     std::thread::current().id(),
-            //     channel
-            // );
-
-            let slot_at = *channel
-                .waiting
-                .iter()
-                .position(|(w, _)| core::ptr::eq(&**w, guard.1.as_ptr()))
-                .get_or_insert(channel.waiting.len());
-
-            if let Some((w, state)) = channel.waiting.get_mut(slot_at) {
-                // Second Poll
-
-                match state {
-                    RecvState::Pending => {
-                        if self.0.sender_count.load(Ordering::SeqCst) == 0 {
-                            Poll::Ready(Err(RecvError::Disconnected))
-                        } else {
-                            let nwaker = cx.waker();
-                            if !w.will_wake(nwaker) {
-                                *w = Arc::new(nwaker.clone());
-                                guard.1 = Arc::downgrade(&w);
-                            }
-
-                            // println!(
-                            //     "{:?} waker updated in recv_async {:?}",
-                            //     std::thread::current().id(),
-                            //     &channel
-                            // );
-
-                            Poll::Pending
-                        }
-                    }
-                    RecvState::Done(msg_op) => {
-                        let msg_op = msg_op.take();
-                        channel.waiting.remove(slot_at);
-                        self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
-                        // println!(
-                        //     "{:?}: recv(after) removed from waiting by receiver {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        Poll::Ready(Ok(msg_op.unwrap()))
-                    }
-                    RecvState::Cancelled => {
-                        channel.waiting.remove(slot_at);
-                        self.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
-                        // println!(
-                        //     "{:?}: recv(after) removed from waiting by receiver {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        Poll::Ready(Err(RecvError::Cancelled))
-                    }
-                }
-            } else {
-                // First Poll
-                if self.0.sender_count.load(Ordering::SeqCst) == 0 {
-                    return Poll::Ready(Err(RecvError::Disconnected));
-                }
-
-                for (w, state) in channel.sending.iter_mut() {
-                    if let SendState::Pending(msg_op) = state {
-                        let msg = msg_op.take().unwrap();
-                        *state = SendState::Done;
-                        w.wake_by_ref();
-
-                        // println!(
-                        //     "{:?}: recv(after) replaced state from sending by receiver {:?}",
-                        //     std::thread::current().id(),
-                        //     &channel
-                        // );
-
-                        return Poll::Ready(Ok(msg));
-                    }
-                }
-
-                if !channel.queue.is_empty() {
-                    if let Some(Some(msg)) = channel.queue.pop_front() {
-                        return Poll::Ready(Ok(msg));
-                    }
-                }
-
-                let waker = Arc::new(cx.waker().clone());
-                guard.1 = Arc::downgrade(&waker);
-                channel.waiting.insert(slot_at, (waker, RecvState::Pending));
-                self.0.nwaiting.fetch_add(1, Ordering::AcqRel);
-
-                // println!(
-                //     "{:?}: recv(after) pending {:?}",
-                //     std::thread::current().id(),
-                //     &channel
-                // );
-
-                Poll::Pending
-            }
-        })
+        RecvFut {
+            receiver: &self,
+            waker_op: None,
+        }
         .await
     }
 }
