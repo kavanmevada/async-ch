@@ -1,6 +1,5 @@
 use core::{fmt::Debug, future::Future};
 use std::{
-    collections::VecDeque,
     sync::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -25,7 +24,7 @@ pub enum Item<T> {
 pub struct Channel<T> {
     sending: Vec<(Waker, Item<T>)>,
     waiting: Vec<(Waker, Item<T>)>,
-    queue: VecDeque<Option<T>>,
+    queue: Vec<Option<T>>,
     length: usize,
 }
 
@@ -45,9 +44,9 @@ impl<T> Channel<T> {
             sending: Vec::with_capacity(32),
             waiting: Vec::with_capacity(32),
             queue: if length == usize::MAX {
-                VecDeque::new()
+                Vec::new()
             } else {
-                VecDeque::with_capacity(length)
+                Vec::with_capacity(length)
             },
             length,
         };
@@ -125,7 +124,8 @@ impl<'s, T> Future for SendFut<'s, T> {
                     }
                 }
                 Item::Empty | Item::Cancelled => {
-                    channel.sending.swap_remove(slot_at);
+                    channel.sending.remove(slot_at);
+
                     self.sender.0.nsending.fetch_sub(1, Ordering::AcqRel);
 
                     Poll::Ready(Ok(()))
@@ -146,7 +146,7 @@ impl<'s, T> Future for SendFut<'s, T> {
             }
 
             if channel.queue.len() < channel.length {
-                channel.queue.push_back(self.msg_op.take());
+                channel.queue.push(self.msg_op.take());
                 return Poll::Ready(Ok(()));
             }
 
@@ -264,13 +264,14 @@ impl<'s, T> Future for RecvFut<'s, T> {
                 }
                 Item::Occupied(msg_op) => {
                     let msg_op = msg_op.take();
-                    channel.waiting.swap_remove(slot_at);
+                    channel.waiting.remove(slot_at);
+
                     self.receiver.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
 
                     Poll::Ready(Ok(msg_op.unwrap()))
                 }
                 Item::Cancelled => {
-                    channel.waiting.swap_remove(slot_at);
+                    channel.waiting.remove(slot_at);
                     self.receiver.0.nwaiting.fetch_sub(1, Ordering::AcqRel);
 
                     Poll::Ready(Err(RecvError::Cancelled))
@@ -291,8 +292,10 @@ impl<'s, T> Future for RecvFut<'s, T> {
                 }
             }
 
-            if let Some(Some(msg)) = channel.queue.swap_remove_front(0) {
-                return Poll::Ready(Ok(msg));
+            if !channel.queue.is_empty() {
+                if let Some(msg) = channel.queue.remove(0) {
+                    return Poll::Ready(Ok(msg));
+                }
             }
 
             self.waker_op = Some(cx.waker().clone());
